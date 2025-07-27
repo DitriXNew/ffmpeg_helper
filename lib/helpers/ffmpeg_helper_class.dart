@@ -10,6 +10,7 @@ import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
 import '../ffmpeg_helper.dart';
+import 'ffmpeg_result.dart';
 
 class FFMpegHelper {
   static final FFMpegHelper _singleton = FFMpegHelper._internal();
@@ -18,8 +19,7 @@ class FFMpegHelper {
   static FFMpegHelper get instance => _singleton;
 
   //
-  final String _ffmpegUrl =
-      "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
+  final String _ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
   String? _tempFolderPath;
   String? _ffmpegBinDirectory;
   String? _ffmpegInstallationPath;
@@ -32,12 +32,9 @@ class FFMpegHelper {
       String appName = packageInfo.appName;
       Directory tempDir = await getTemporaryDirectory();
       _tempFolderPath = path.join(tempDir.path, "ffmpeg");
-      Directory ffmpegInstallDir =
-          ffmpegBaseDir ?? await getApplicationDocumentsDirectory();
-      _ffmpegInstallationPath =
-          path.join(ffmpegInstallDir.path, appName, "ffmpeg");
-      _ffmpegBinDirectory = path.join(
-          _ffmpegInstallationPath!, "ffmpeg-master-latest-win64-gpl", "bin");
+      Directory ffmpegInstallDir = ffmpegBaseDir ?? await getApplicationDocumentsDirectory();
+      _ffmpegInstallationPath = path.join(ffmpegInstallDir.path, appName, "ffmpeg");
+      _ffmpegBinDirectory = path.join(_ffmpegInstallationPath!, "ffmpeg-master-latest-win64-gpl", "bin");
     }
   }
 
@@ -169,6 +166,25 @@ class FFMpegHelper {
     }
   }
 
+  /// Runs FFmpeg command synchronously and captures stderr output
+  /// Returns the stderr output as a string along with the output file
+  Future<FFmpegResult> runSyncWithStderr(
+    FFMpegCommand command, {
+    Function(Statistics statistics)? statisticsCallback,
+  }) async {
+    if (Platform.isWindows || Platform.isLinux) {
+      return _runSyncOnWindowsWithStderr(
+        command,
+        statisticsCallback: statisticsCallback,
+      );
+    } else {
+      return _runSyncOnNonWindowsWithStderr(
+        command,
+        statisticsCallback: statisticsCallback,
+      );
+    }
+  }
+
   Future<Process> _startWindowsProcess(
     FFMpegCommand command, {
     Function(Statistics statistics)? statisticsCallback,
@@ -200,12 +216,9 @@ class FFMpegHelper {
             int.tryParse(temp['total_size']) ?? 0,
             int.tryParse(temp['out_time_us']) ?? 0,
             // 2189.6kbits/s => 2189.6
-            double.tryParse(
-                    temp['bitrate']?.replaceAll(RegExp('[a-z/]'), '')) ??
-                0.0,
+            double.tryParse(temp['bitrate']?.replaceAll(RegExp('[a-z/]'), '')) ?? 0.0,
             // 2.15x => 2.15
-            double.tryParse(temp['speed']?.replaceAll(RegExp('[a-z/]'), '')) ??
-                0.0,
+            double.tryParse(temp['speed']?.replaceAll(RegExp('[a-z/]'), '')) ?? 0.0,
           ));
         } catch (e) {
           if (kDebugMode) {
@@ -237,6 +250,70 @@ class FFMpegHelper {
     }
   }
 
+  /// Windows implementation that captures stderr
+  Future<FFmpegResult> _runSyncOnWindowsWithStderr(
+    FFMpegCommand command, {
+    Function(Statistics statistics)? statisticsCallback,
+  }) async {
+    String ffmpeg = 'ffmpeg';
+    if ((_ffmpegBinDirectory != null) && (Platform.isWindows)) {
+      ffmpeg = path.join(_ffmpegBinDirectory!, "ffmpeg.exe");
+    }
+
+    // Start process
+    Process process = await Process.start(
+      ffmpeg,
+      command.toCli(),
+    );
+
+    // Capture stderr
+    String stderrOutput = '';
+    process.stderr.transform(utf8.decoder).listen((String data) {
+      stderrOutput += data;
+    });
+
+    // Handle stdout statistics as before
+    process.stdout.transform(utf8.decoder).listen((String event) {
+      List<String> data = event.split("\n");
+      Map<String, dynamic> temp = {};
+      for (String element in data) {
+        List<String> kv = element.split("=");
+        if (kv.length == 2) {
+          temp[kv.first] = kv.last;
+        }
+      }
+      if (temp.isNotEmpty) {
+        try {
+          statisticsCallback?.call(Statistics(
+            process.pid,
+            int.tryParse(temp['frame']) ?? 0,
+            double.tryParse(temp['fps']) ?? 0.0,
+            double.tryParse(temp['stream_0_0_q']) ?? 0.0,
+            int.tryParse(temp['total_size']) ?? 0,
+            int.tryParse(temp['out_time_us']) ?? 0,
+            // 2189.6kbits/s => 2189.6
+            double.tryParse(temp['bitrate']?.replaceAll(RegExp('[a-z/]'), '')) ?? 0.0,
+            // 2.15x => 2.15
+            double.tryParse(temp['speed']?.replaceAll(RegExp('[a-z/]'), '')) ?? 0.0,
+          ));
+        } catch (e) {
+          if (kDebugMode) {
+            print(e);
+          }
+        }
+      }
+    });
+
+    // Wait for process to complete
+    final int exitCode = await process.exitCode;
+
+    if (exitCode == ReturnCode.success) {
+      return FFmpegResult(outputFile: File(command.outputFilepath), stderr: stderrOutput);
+    } else {
+      return FFmpegResult(outputFile: null, stderr: stderrOutput);
+    }
+  }
+
   Future<File?> _runSyncOnNonWindows(
     FFMpegCommand command, {
     Function(Statistics statistics)? statisticsCallback,
@@ -264,6 +341,46 @@ class FFMpegHelper {
     return completer.future;
   }
 
+  /// Non-Windows implementation that captures stderr through logs
+  Future<FFmpegResult> _runSyncOnNonWindowsWithStderr(
+    FFMpegCommand command, {
+    Function(Statistics statistics)? statisticsCallback,
+  }) async {
+    Completer<FFmpegResult> completer = Completer();
+    String stderrOutput = '';
+
+    await FFmpegKit.executeAsync(
+      command.toCli().join(' '),
+      (FFmpegSession session) async {
+        final code = await session.getReturnCode();
+
+        // Get all logs from the session
+        final logs = await session.getAllLogs();
+        for (final log in logs) {
+          final message = log.getMessage();
+          if (message.contains('silencedetect') || message.contains('silence_start') || message.contains('silence_end')) {
+            stderrOutput += '$message\n';
+          }
+        }
+
+        if (code?.isValueSuccess() == true) {
+          if (!completer.isCompleted) {
+            completer.complete(FFmpegResult(outputFile: File(command.outputFilepath), stderr: stderrOutput));
+          }
+        } else {
+          if (!completer.isCompleted) {
+            completer.complete(FFmpegResult(outputFile: null, stderr: stderrOutput));
+          }
+        }
+      },
+      null,
+      (Statistics statistics) {
+        statisticsCallback?.call(statistics);
+      },
+    );
+    return completer.future;
+  }
+
   Future<MediaInformation?> runProbe(String filePath) async {
     if (Platform.isWindows || Platform.isLinux) {
       return _runProbeOnWindows(filePath);
@@ -275,8 +392,7 @@ class FFMpegHelper {
   Future<MediaInformation?> _runProbeOnNonWindows(String filePath) async {
     Completer<MediaInformation?> completer = Completer<MediaInformation?>();
     try {
-      await FFprobeKit.getMediaInformationAsync(filePath,
-          (MediaInformationSession session) async {
+      await FFprobeKit.getMediaInformationAsync(filePath, (MediaInformationSession session) async {
         final MediaInformation? information = session.getMediaInformation();
         if (information != null) {
           if (!completer.isCompleted) {
@@ -311,9 +427,7 @@ class FFMpegHelper {
       '-show_chapters',
       filePath,
     ]);
-    if (result.stdout == null ||
-        result.stdout is! String ||
-        (result.stdout as String).isEmpty) {
+    if (result.stdout == null || result.stdout is! String || (result.stdout as String).isEmpty) {
       return null;
     }
     if (result.exitCode == ReturnCode.success) {
